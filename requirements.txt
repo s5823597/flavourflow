@@ -1,5 +1,5 @@
 streamlit
-yt-dlp
+yt-dlp[default,curl-cffi]>=2026.8.19
 openai-whisper
 groq
 python-dotenv

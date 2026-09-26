@@ -2,7 +2,6 @@
 # Standard libraries and third-party packages used across the pipeline
 import streamlit as st       # Web UI framework
 import yt_dlp                # Downloads videos and subtitles from TikTok, Instagram, YouTube
-import whisper               # OpenAI speech-to-text model (runs locally)
 import json                  # Parse and serialise JSON data
 import os                    # File and directory operations
 import re                    # Regular expressions (used to clean LLM output)
@@ -10,12 +9,25 @@ import sqlite3               # Lightweight local database for recipe history
 import subprocess            # Run ffmpeg as a shell command to extract video frames
 import base64                # Encode image files to text for the vision API
 import datetime              # Timestamp each saved recipe
+from pathlib import Path
+from html import escape
 from groq import Groq        # Groq API client — hosts LLaMA 4 Scout and LLaMA 3.3 70B
 from dotenv import load_dotenv  # Loads GROQ_API_KEY from the .env file
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 load_dotenv()
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # Read API key from environment
+def setting(name, default=""):
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except FileNotFoundError:
+        return default
+
+GROQ_API_KEY = setting("GROQ_API_KEY")
+VISION_MODEL = setting("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+RECIPE_MODEL = setting("GROQ_RECIPE_MODEL", "openai/gpt-oss-120b")
 DB_FILE      = "outputs/flavourflow.db"             # SQLite database file path
 
 # ── Page setup ─────────────────────────────────────────────────────────────────
@@ -26,11 +38,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── API key guard ───────────────────────────────────────────────────────────────
-# Stop the app immediately if no API key is found — everything else depends on Groq
-if not GROQ_API_KEY:
-    st.error("No GROQ API key found. Please create a `.env` file in the project folder with:\n\n`GROQ_API_KEY=your_key_here`\n\nGet a free key at https://console.groq.com")
-    st.stop()
+# Keep the interface and saved recipes available before credentials are configured.
+def require_api_key():
+    if not GROQ_API_KEY:
+        st.error("Recipe extraction is not configured yet. Add GROQ_API_KEY to Streamlit app secrets or the local .env file, then restart the app.")
+        st.stop()
 
 # ── Session state ───────────────────────────────────────────────────────────────
 # Streamlit re-runs the entire script on every user interaction.
@@ -413,7 +425,7 @@ def download_video(url):
     os.makedirs("outputs", exist_ok=True)
     opts = {
         "writesubtitles": True, "subtitleslangs": ["all"],
-        "writeautomaticsub": True, "outtmpl": "outputs/%(id)s.%(ext)s", "quiet": True,
+        "writeautomaticsub": True, "format": "best[ext=mp4]/best", "merge_output_format": "mp4", "outtmpl": "outputs/%(id)s.%(ext)s", "quiet": True,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -424,7 +436,14 @@ def download_video(url):
             vf = f"outputs/{fname}"
         if video_id and video_id in fname and (".vtt" in fname or ".srt" in fname):
             sf = f"outputs/{fname}"
+    if not vf:
+        raise RuntimeError("The download did not produce a playable video file.")
     return vf, sf
+
+@st.cache_resource(show_spinner=False)
+def load_whisper_model(model_size):
+    import whisper
+    return whisper.load_model(model_size)
 
 def extract_speech(sf, vf, model_size="small"):
     """
@@ -444,43 +463,46 @@ def extract_speech(sf, vf, model_size="small"):
         return text.strip(), "Platform subtitles"
     if vf:
         # Load Whisper model and transcribe the audio — runs on CPU if no GPU is available
-        model = whisper.load_model(model_size)
+        model = load_whisper_model(model_size)
         return model.transcribe(vf)["text"].strip(), f"Whisper {model_size}"
     return "", "none"
 
 def extract_frames_and_analyse(video_file, num_frames=10):
     """
     Stage 4: Extract video frames using ffmpeg, then send them to LLaMA 4 Scout (vision model).
-    Frames are sampled at fps=1/3 (one frame every 3 seconds), up to num_frames total.
+    Frames are sampled evenly across the whole video, up to num_frames total.
     Each frame is base64-encoded so it can be sent as text in the Groq API request.
-    All frames are sent in a single API call so the model can cross-reference them.
+    Frames are sent in batches of at most three to respect the current vision limit.
     Returns (visual description text, frames directory path).
     """
     if not video_file or not GROQ_API_KEY:
         return "", None
-    fd = f"outputs/frames_{os.path.basename(video_file).split('.')[0]}"
+    fd = f"outputs/frames_{Path(video_file).stem}"
     os.makedirs(fd, exist_ok=True)
-    # Run ffmpeg to extract frames from the video file
-    subprocess.run(
-        ["ffmpeg", "-i", video_file, "-vf", "fps=1/3", "-vframes", str(num_frames),
-         f"{fd}/frame_%02d.jpg", "-y", "-loglevel", "error"]
-    )
-    frames = sorted([f"{fd}/{f}" for f in os.listdir(fd) if f.endswith(".jpg")])
+    for old in Path(fd).glob("frame_*.jpg"):
+        old.unlink()
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", video_file], capture_output=True, text=True, check=True)
+    duration = float(probe.stdout.strip())
+    fps = num_frames / max(duration, 0.1)
+    subprocess.run(["ffmpeg", "-i", video_file, "-vf", f"fps={fps},scale=960:-2",
+                    "-frames:v", str(num_frames), f"{fd}/frame_%02d.jpg", "-y", "-loglevel", "error"], check=True)
+    frames = sorted(Path(fd).glob("frame_*.jpg"))
     if not frames:
-        return "", None
-    # Build the message content: one image per frame plus a text instruction
-    content = []
-    for fp in frames:
-        with open(fp, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    content.append({"type": "text", "text": "Describe what ingredients, cooking techniques, and dishes you can see. Be specific and concise."})
-    # Send all frames to LLaMA 4 Scout via Groq vision API
+        raise RuntimeError("No video frames could be extracted.")
     client = Groq(api_key=GROQ_API_KEY)
-    resp = client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[{"role": "user", "content": content}], max_tokens=512)
-    return resp.choices[0].message.content, fd
+    descriptions = []
+    # Current Groq vision API accepts at most three images per request.
+    for offset in range(0, len(frames), 3):
+        content = [{"type": "text", "text": "Describe the ingredients, cooking actions and visible quantities in these consecutive frames. Do not invent unseen ingredients."}]
+        for frame in frames[offset:offset + 3]:
+            b64 = base64.b64encode(frame.read_bytes()).decode()
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        response = client.chat.completions.create(model=VISION_MODEL,
+            messages=[{"role": "user", "content": content}], max_completion_tokens=1024)
+        descriptions.append(response.choices[0].message.content or "")
+    return "\n".join(descriptions), fd
+
 
 def extract_recipe(meta, speech_text, visual_desc):
     """
@@ -506,12 +528,13 @@ Translate everything to English. Respond ONLY with valid JSON.
 
 Video Data:\n{context}"""
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=RECIPE_MODEL,
         messages=[
             {"role": "system", "content": "You are a recipe extraction assistant. Always respond in valid JSON in English only."},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=1400, temperature=0.1,
+        max_completion_tokens=4096, temperature=0.1,
+        response_format={"type": "json_object"},
     )
     # Strip markdown code fences (```json ... ```) that the model sometimes adds
     raw = re.sub(r"```(?:json)?\s*", "", resp.choices[0].message.content).strip()
@@ -954,6 +977,7 @@ def run_pipeline(url: str, player: str):
     Used in Battle Mode when the user pastes a new URL instead of selecting a saved recipe.
     Returns (recipe dict, frame base64) or (None, None) on failure.
     """
+    require_api_key()
     ph = st.empty()
     def status(step, msg, ok=True):
         pct = int((step / 5) * 100)
@@ -1009,16 +1033,16 @@ with st.sidebar:
     st.markdown('<hr style="border-color:#1A1A3A;margin:0.8rem 0;">', unsafe_allow_html=True)
 
     # AI model badges
-    st.markdown("""
+    st.markdown(f"""
     <div style="font-family:'Press Start 2P',monospace;font-size:0.42rem;
                 color:#3A3A6A;letter-spacing:3px;margin-bottom:0.6rem;">POWERED BY</div>
     <div style="display:flex;flex-direction:column;gap:0.4rem;margin-bottom:0.8rem;">
         <span style="background:#08080F;border:1px solid #3b82f6;color:#93c5fd;
                      padding:4px 10px;font-size:0.72rem;font-weight:600;">Whisper ASR</span>
         <span style="background:#08080F;border:1px solid #a855f7;color:#d8b4fe;
-                     padding:4px 10px;font-size:0.72rem;font-weight:600;">LLaMA 4 Scout Vision</span>
+                     padding:4px 10px;font-size:0.72rem;font-weight:600;">Vision model: {escape(VISION_MODEL)}</span>
         <span style="background:#08080F;border:1px solid #22c55e;color:#86efac;
-                     padding:4px 10px;font-size:0.72rem;font-weight:600;">LLaMA 3.3 70B</span>
+                     padding:4px 10px;font-size:0.72rem;font-weight:600;">Recipe model: {escape(RECIPE_MODEL)}</span>
         <span style="background:#08080F;border:1px solid #f97316;color:#fdba74;
                      padding:4px 10px;font-size:0.72rem;font-weight:600;">yt-dlp + ffmpeg</span>
     </div>""", unsafe_allow_html=True)
@@ -1107,6 +1131,7 @@ with tab_extract:
     st.markdown('<hr style="border-color:#2A2A4A;margin:1rem 0;">', unsafe_allow_html=True)
 
     if analyse and url.strip():
+        require_api_key()
         # Run the pipeline when user clicks Analyse
         left_col, right_col = st.columns([1, 2])
         with left_col:
@@ -1133,10 +1158,14 @@ with tab_extract:
         # Stage 3: Extract speech — soft failure returns empty string, pipeline continues
         status_ph.markdown(_pipeline_status(2, "Extracting speech…"), unsafe_allow_html=True)
         _wm = st.session_state.get("whisper_model", "small")
-        speech_text, speech_source = extract_speech(sf, vf, model_size=_wm)
+        try:
+            speech_text, speech_source = extract_speech(sf, vf, model_size=_wm)
+        except Exception:
+            speech_text, speech_source = "", "visual analysis and metadata"
+            st.warning("Speech extraction failed. Continuing with video frames and metadata.")
 
         # Stage 4: Vision analysis — soft failure returns empty string, pipeline continues
-        status_ph.markdown(_pipeline_status(3, "Vision analysis (LLaMA 4 Scout)…"), unsafe_allow_html=True)
+        status_ph.markdown(_pipeline_status(3, "Analysing video frames…"), unsafe_allow_html=True)
         _nf = st.session_state.get("num_frames", 10)
         try:
             visual_desc, frames_dir = extract_frames_and_analyse(vf, num_frames=_nf) if vf else ("", None)
@@ -1144,7 +1173,7 @@ with tab_extract:
             visual_desc, frames_dir = f"[Vision skipped: {e}]", None
 
         # Stage 5: Extract recipe — hard failure halts pipeline
-        status_ph.markdown(_pipeline_status(4, "Extracting recipe (LLaMA 3.3 70B)…"), unsafe_allow_html=True)
+        status_ph.markdown(_pipeline_status(4, "Structuring the recipe…"), unsafe_allow_html=True)
         try:
             recipe, _ = extract_recipe(meta, speech_text, visual_desc)
         except Exception as e:

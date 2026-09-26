@@ -120,3 +120,13 @@ outputs/               → downloaded videos, frames, database (gitignored)
 - Frame sampling may miss ingredients shown very briefly in the video
 - Cannot download private or region-locked videos
 - UK price estimates are LLM approximations, not live supermarket data
+
+## Deployment maintenance (September 2026)
+
+The original MSc prototype used LLaMA 4 Scout and LLaMA 3.3 70B. Groq retired these IDs for free/developer accounts. Current defaults are `qwen/qwen3.8-27b` for vision and `openai/gpt-oss-120b` for structured recipes. Override them with `GROQ_VISION_MODEL` and `GROQ_RECIPE_MODEL` in environment variables or Streamlit secrets. Vision requests use batches of at most three frames.
+
+For Community Cloud, configure `GROQ_API_KEY` in the app's Secrets settings. For local use, keep it in `.env`. Never commit `.env` or `.streamlit/secrets.toml`. The UI and recipe library remain available without a key; extraction reports the missing configuration. Whisper loads only when subtitles are unavailable and caches the selected model.
+
+Install dependencies with `pip install -r requirements.txt`. The updated yt-dlp dependency includes browser impersonation support required by some TikTok responses. FFmpeg must be installed (`packages.txt` supplies it on Community Cloud).
+
+Validation: `python test_pipeline.py` checks full-duration frame sampling, three-image request batches, and removal of stale frames. Streamlit AppTest also verifies startup and the no-key extraction message. End-to-end API extraction still requires a valid Groq key.
